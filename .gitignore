@@ -35,6 +35,17 @@ build-deps-balazs.sh
 
 # Virtual environments
 .venv
+__pycache__/
+*.py[cod]
+
+# Local datasets and precompiled distributions
+/data/
+/bin/
+
+# Local experiment outputs and runtime logs
+/.tmp_sm26_prebuilt_test/
+/.playwright-cli/
+/roofer.log.json
 
 # Other
 *.DS_Store
