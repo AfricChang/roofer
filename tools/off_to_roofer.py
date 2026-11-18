@@ -7,10 +7,11 @@ This utility is intended for local preparation of a mesh-derived point cloud:
 * roof samples are generated on an XY grid from non-vertical mesh triangles;
 * each grid cell keeps the highest sampled roof elevation (class 6);
 * small gaps can be filled from neighbouring roof cells;
-* the supplied OFF polygon is written as a 2D GeoJSON building footprint.
+* all rings of the supplied OFF footprint are preserved in GeoJSON;
+* footprint holes are excluded from roof sampling and small-gap filling.
 
-The implementation uses only the Python standard library. Coordinates are
-assumed to be projected metres, matching Roofer's input requirements.
+Shapely is required to validate the footprint topology. Coordinates are assumed
+to be projected metres, matching Roofer's input requirements.
 """
 
 from __future__ import annotations
@@ -64,13 +65,18 @@ def read_off(path: Path) -> OffMesh:
             raise ValueError(f"{path}: OFF counts line must contain vertices and faces")
         vertex_count = int(counts[0])
         face_count = int(counts[1])
+        if vertex_count < 0 or face_count < 0:
+            raise ValueError(f"{path}: OFF counts must be non-negative")
 
         vertices: list[Vertex] = []
         for index in range(vertex_count):
             values = _next_data_line(stream, path).split()
             if len(values) < 3:
                 raise ValueError(f"{path}: vertex {index} has fewer than 3 coordinates")
-            vertices.append(Vertex(float(values[0]), float(values[1]), float(values[2])))
+            coordinates = tuple(float(value) for value in values[:3])
+            if not all(math.isfinite(value) for value in coordinates):
+                raise ValueError(f"{path}: vertex {index} has a non-finite coordinate")
+            vertices.append(Vertex(*coordinates))
 
         faces: list[list[int]] = []
         for index in range(face_count):
@@ -80,35 +86,79 @@ def read_off(path: Path) -> OffMesh:
             ring_size = int(values[0])
             if ring_size < 3 or len(values) < ring_size + 1:
                 raise ValueError(f"{path}: face {index} is malformed")
-            faces.append([int(value) for value in values[1 : ring_size + 1]])
+            ring = [int(value) for value in values[1 : ring_size + 1]]
+            if any(not 0 <= vertex_index < vertex_count for vertex_index in ring):
+                raise ValueError(f"{path}: face {index} references an invalid vertex")
+            faces.append(ring)
 
     return OffMesh(vertices=vertices, faces=faces)
 
 
-def select_polygon(mesh: OffMesh, path: Path) -> list[tuple[float, float]]:
-    """Select the largest face as the footprint ring from a polygon OFF file."""
+def _signed_area(ring: Sequence[tuple[float, float]]) -> float:
+    # 平移到首点后求面积，避免投影坐标绝对值较大时的消减误差。
+    origin_x, origin_y = ring[0]
+    return 0.5 * math.fsum(
+        (ring[index][0] - origin_x) * (ring[(index + 1) % len(ring)][1] - origin_y)
+        - (ring[(index + 1) % len(ring)][0] - origin_x) * (ring[index][1] - origin_y)
+        for index in range(len(ring))
+    )
+
+
+def select_polygon(
+    mesh: OffMesh,
+    path: Path,
+) -> list[list[tuple[float, float]]]:
+    """读取每环一个面的 P；只接受单外环及严格分离的洞，不静默修复拓扑。"""
+
+    try:
+        from shapely.geometry import Polygon
+    except ImportError as error:
+        raise ValueError("footprint topology validation requires Shapely") from error
 
     if not mesh.faces:
         if len(mesh.vertices) < 3:
             raise ValueError(f"{path}: polygon OFF has fewer than 3 vertices")
-        ring = list(range(len(mesh.vertices)))
+        face_rings = [list(range(len(mesh.vertices)))]
     else:
-        ring = max(mesh.faces, key=len)
+        face_rings = mesh.faces
 
-    if len(ring) < 3:
-        raise ValueError(f"{path}: footprint ring has fewer than 3 vertices")
+    rings = []
+    for ring in face_rings:
+        if len(ring) < 3:
+            raise ValueError(f"{path}: footprint ring has fewer than 3 vertices")
+        if any(type(index) is not int or not 0 <= index < len(mesh.vertices) for index in ring):
+            raise ValueError(f"{path}: footprint references an invalid vertex")
+        points = [(mesh.vertices[index].x, mesh.vertices[index].y) for index in ring]
+        if not all(math.isfinite(value) for point in points for value in point):
+            raise ValueError(f"{path}: footprint has a non-finite coordinate")
+        rings.append(points)
 
-    try:
-        polygon = [(mesh.vertices[index].x, mesh.vertices[index].y) for index in ring]
-    except IndexError as error:
-        raise ValueError(f"{path}: footprint references an invalid vertex") from error
+    polygons = [Polygon(ring) for ring in rings]
+    for index, polygon in enumerate(polygons):
+        if not polygon.is_valid or polygon.is_empty or polygon.area <= 0:
+            raise ValueError(f"{path}: footprint ring {index} is invalid or degenerate")
+    outer_index = max(range(len(rings)), key=lambda index: polygons[index].area)
+    outer = rings[outer_index]
+    holes = [ring for index, ring in enumerate(rings) if index != outer_index]
+    outer_polygon = polygons[outer_index]
+    hole_polygons = [polygon for index, polygon in enumerate(polygons) if index != outer_index]
+    for index, hole in enumerate(hole_polygons):
+        if not outer_polygon.contains(hole) or not outer_polygon.boundary.disjoint(hole):
+            raise ValueError(f"{path}: footprint hole is not strictly inside the outer ring")
+        if any(not hole.disjoint(other) for other in hole_polygons[:index]):
+            raise ValueError(f"{path}: footprint holes overlap, touch, or are nested")
+    if not Polygon(outer, holes).is_valid:
+        raise ValueError(f"{path}: footprint polygon with holes is invalid")
 
-    return polygon
+    return [outer] + holes
 
 
-def polygon_bounds(polygon: Sequence[tuple[float, float]]) -> tuple[float, float, float, float]:
-    xs = [point[0] for point in polygon]
-    ys = [point[1] for point in polygon]
+def polygon_bounds(
+    rings: Sequence[Sequence[tuple[float, float]]],
+) -> tuple[float, float, float, float]:
+    points = [point for ring in rings for point in ring]
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
     return min(xs), min(ys), max(xs), max(ys)
 
 
@@ -145,6 +195,18 @@ def point_in_polygon(x: float, y: float, polygon: Sequence[tuple[float, float]])
                 inside = not inside
         previous = current
     return inside
+
+
+def point_in_footprint(
+    x: float,
+    y: float,
+    rings: Sequence[Sequence[tuple[float, float]]],
+) -> bool:
+    """外环边界属于足迹；洞内部及洞边界均不属于屋顶采样/补点区域。"""
+
+    return point_in_polygon(x, y, rings[0]) and not any(
+        point_in_polygon(x, y, hole) for hole in rings[1:]
+    )
 
 
 def _triangle_normal(
@@ -189,7 +251,7 @@ def _cell_center(index: int, origin: float, cell_size: float) -> float:
 
 def rasterize_roof(
     mesh: OffMesh,
-    polygon: Sequence[tuple[float, float]],
+    rings: Sequence[Sequence[tuple[float, float]]],
     grid_size: float,
     normal_z_threshold: float,
     fill_passes: int,
@@ -197,7 +259,7 @@ def rasterize_roof(
 ) -> tuple[dict[tuple[int, int], float], int]:
     """Sample roof triangles and fill small gaps on the same regular grid."""
 
-    polygon_min_x, polygon_min_y, polygon_max_x, polygon_max_y = polygon_bounds(polygon)
+    polygon_min_x, polygon_min_y, polygon_max_x, polygon_max_y = polygon_bounds(rings)
     grid: dict[tuple[int, int], float] = {}
 
     min_i = _cell_index(polygon_min_x, polygon_min_x, grid_size) - 1
@@ -232,7 +294,7 @@ def rasterize_roof(
                 x = _cell_center(i, polygon_min_x, grid_size)
                 for j in range(start_j, end_j + 1):
                     y = _cell_center(j, polygon_min_y, grid_size)
-                    if not point_in_polygon(x, y, polygon):
+                    if not point_in_footprint(x, y, rings):
                         continue
                     inside, wa, wb, wc = _barycentric_contains(x, y, a, b, c)
                     if not inside:
@@ -257,7 +319,7 @@ def rasterize_roof(
                     if key in grid:
                         continue
                     y = _cell_center(j, polygon_min_y, grid_size)
-                    if not point_in_polygon(x, y, polygon):
+                    if not point_in_footprint(x, y, rings):
                         continue
                     neighbours = [
                         grid[neighbour_key]
@@ -290,19 +352,22 @@ def _format_grid_suffix(grid_size: float) -> str:
 
 def write_geojson(
     path: Path,
-    polygon: Sequence[tuple[float, float]],
+    rings: Sequence[Sequence[tuple[float, float]]],
     building_id: str,
 ) -> None:
-    ring = [[x, y] for x, y in polygon]
-    if ring[0] != ring[-1]:
-        ring.append(ring[0])
+    coordinates = []
+    for source_ring in rings:
+        ring = [[x, y] for x, y in source_ring]
+        if ring[0] != ring[-1]:
+            ring.append(ring[0])
+        coordinates.append(ring)
     document = {
         "type": "FeatureCollection",
         "features": [
             {
                 "type": "Feature",
                 "properties": {"building_id": building_id},
-                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "geometry": {"type": "Polygon", "coordinates": coordinates},
             }
         ],
     }
@@ -451,22 +516,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         started = time.perf_counter()
         mesh = read_off(args.mesh_off)
         footprint_mesh = read_off(args.footprint_off)
-        polygon = select_polygon(footprint_mesh, args.footprint_off)
+        footprint_rings = select_polygon(footprint_mesh, args.footprint_off)
         building_id = args.building_id or args.mesh_off.parent.name or args.mesh_off.stem
 
         roof_grid, filled_points = rasterize_roof(
             mesh=mesh,
-            polygon=polygon,
+            rings=footprint_rings,
             grid_size=args.grid_size,
             normal_z_threshold=args.normal_z_threshold,
             fill_passes=args.fill_passes,
             fill_max_range=args.fill_max_range,
         )
-        polygon_min_x, polygon_min_y, _, _ = polygon_bounds(polygon)
+        polygon_min_x, polygon_min_y, _, _ = polygon_bounds(footprint_rings)
         ground_points = [
             vertex
             for vertex in mesh.vertices
-            if not point_in_polygon(vertex.x, vertex.y, polygon)
+            if not point_in_footprint(vertex.x, vertex.y, footprint_rings)
         ]
         roof_points = [
             Vertex(
@@ -492,7 +557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             roof_class=args.roof_class,
             ground_class=args.ground_class,
         )
-        write_geojson(geojson_path, polygon, building_id)
+        write_geojson(geojson_path, footprint_rings, building_id)
 
         stats = {
             "source_vertices": len(mesh.vertices),
@@ -506,6 +571,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "hole_fill_max_height_range": args.fill_max_range,
             "fill_passes": args.fill_passes,
             "building_id": building_id,
+            "footprint_off": str(args.footprint_off),
+            "footprint_ring_count": len(footprint_rings),
+            "footprint_hole_count": len(footprint_rings) - 1,
+            "footprint_outer_area_m2": abs(_signed_area(footprint_rings[0])),
+            "footprint_hole_area_m2": sum(
+                abs(_signed_area(ring)) for ring in footprint_rings[1:]
+            ),
+            "footprint_area_m2": abs(_signed_area(footprint_rings[0])) - sum(
+                abs(_signed_area(ring)) for ring in footprint_rings[1:]
+            ),
             "las": str(las_path),
             "geojson": str(geojson_path),
             "seconds": round(time.perf_counter() - started, 3),
