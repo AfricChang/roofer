@@ -54,6 +54,14 @@ namespace roofer::reconstruction {
     "Maximum step height dissolved during LoD 1.3 generalisation, in "   \
     "metres.",                                                           \
     config::greater_than(0.0F), public_)                                 \
+  X(bool, roof_height_sanity_clamp, true,                                \
+    "Post-processing sanity check: clamp reconstructed roof heights to " \
+    "the measured roof maximum plus a tolerance (upstream #172).",       \
+    config::no_validation<bool>(), public_)                              \
+  X(float, roof_height_clamp_tolerance, 0.5F,                            \
+    "Tolerance above the measured roof maximum for the roof height "     \
+    "sanity clamp, in metres.",                                          \
+    config::at_least(0.0F), public_)                                     \
   X(float, unit_scale, 1.0F,                                             \
     "Metres per input coordinate unit. Distance parameters specified "   \
     "in metres are converted to input units for reconstruction using "   \
@@ -129,6 +137,7 @@ namespace roofer::reconstruction {
       const float area_scale = distance_scale * distance_scale;
 
       result.lod13_step_height *= distance_scale;
+      result.roof_height_clamp_tolerance *= distance_scale;
       result.plane_detector.plane_epsilon *= distance_scale;
       result.plane_detector.ransac_cluster_epsilon *= distance_scale;
       result.plane_detector.maximum_offset *= distance_scale;

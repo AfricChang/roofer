@@ -49,3 +49,5 @@ __pycache__/
 
 # Other
 *.DS_Store
+/.tmp_overlay_ports
+/.tmp_sm12_test

@@ -134,6 +134,31 @@ void compute_mesh_properties(
                                               .h_min = cfg->a_h_roof_min,
                                               .h_max = cfg->a_h_roof_max});
   }
+
+  if (cfg->reconstruction.roof_height_sanity_clamp) {
+    auto cap_h_attrs = [&](std::unordered_map<int, roofer::Mesh>& ms) {
+      for (auto& [i, mesh] : ms) {
+        auto& polys = mesh.get_polygons();
+        auto& labels = mesh.get_labels();
+        auto& attrs = mesh.get_attributes();
+        for (size_t f = 0; f < polys.size(); ++f) {
+          if (labels[f] != 1 || polys[f].empty()) continue;
+          float vmax = polys[f][0][2];
+          for (const auto& p : polys[f]) vmax = std::max(vmax, p[2]);
+          vmax += z_offset;
+          for (const auto* key :
+               {&cfg->a_h_roof_max, &cfg->a_h_roof_50p, &cfg->a_h_roof_70p}) {
+            if (key->empty()) continue;
+            if (float* v = attrs[f].get_if<float>(*key))
+              if (*v > vmax) *v = vmax;
+          }
+        }
+      }
+    };
+    cap_h_attrs(multisolid_lod12);
+    cap_h_attrs(multisolid_lod13);
+    cap_h_attrs(multisolid_lod22);
+  }
 }
 
 void multisolid_post_process(BuildingObject& building, RooferConfig* cfg,
@@ -262,6 +287,46 @@ std::unordered_map<int, roofer::Mesh> extrude_lod22(
                 .with_class_ids(ArrangementExtruder->labels));
   }
 #endif
+
+  if (reconstruction.roof_height_sanity_clamp &&
+      building.roof_elevation_max.has_value()) {
+    const float tolerance = reconstruction.roof_height_clamp_tolerance;
+    const float global_cap =
+        *building.roof_elevation_max - building.z_offset + tolerance;
+    const auto pc_box = building.pointcloud_building.box();
+    const double cell = 0.5 / cfg->reconstruction.unit_scale;
+    roofer::RasterTools::Raster support(cell, pc_box.min()[0], pc_box.max()[0],
+                                        pc_box.min()[1], pc_box.max()[1]);
+    support.prefill_arrays(roofer::RasterTools::MAX);
+    for (const auto& p : building.pointcloud_building)
+      support.add_point(p[0], p[1], p[2], roofer::RasterTools::MAX);
+    size_t clamped = 0;
+    auto clamp_ring = [&](roofer::vec3f& ring) {
+      for (auto& p : ring) {
+        float cap = global_cap;
+        double x = p[0], y = p[1];
+        if (support.check_point(x, y) && !support.isNoData(x, y))
+          cap = std::min(cap, float(support.sample(x, y)) + tolerance);
+        if (p[2] > cap) {
+          p[2] = cap;
+          ++clamped;
+        }
+      }
+    };
+    for (auto& ms : ArrangementExtruder->multisolid) {
+      auto& mesh = ms.second;
+      auto& polygons = mesh.get_polygons();
+      for (size_t i = 0; i < polygons.size(); ++i) {
+        clamp_ring(polygons[i]);
+        for (auto& hole : polygons[i].interior_rings()) clamp_ring(hole);
+      }
+    }
+    if (clamped > 0)
+      logger.info(
+          "Roof height sanity clamp: lowered {} vertex(es) to local measured "
+          "support + tolerance (global cap {:.2f} m)",
+          clamped, global_cap + building.z_offset);
+  }
 
   multisolid_post_process(building, cfg, lod, ArrangementExtruder->multisolid,
                           rmse, volume, attr_val3dity);
